@@ -110,7 +110,7 @@ class _Console:
     # ── 原始终端路径 ──
 
     def _getch(self) -> str:
-        """读取单个按键。Windows 用 msvcrt，Unix 用原始终端。"""
+        """读取单个按键。Windows 用 msvcrt；Unix 由 _raw_input 持有 raw 模式，此处直接读 stdin。"""
         if os.name == "nt":
             import msvcrt
             ch = msvcrt.getwch()
@@ -119,18 +119,26 @@ class _Console:
                     msvcrt.getwch(), "")
             return ch
         else:
-            import termios, tty
-            fd = sys.stdin.fileno()
-            old = termios.tcgetattr(fd)
-            try:
-                tty.setraw(fd)
-                ch = sys.stdin.buffer.read(1).decode(errors="replace")
-                if ch == "\x1b":
-                    tail = sys.stdin.buffer.read(2).decode(errors="replace")
-                    return "\x1b" + tail
+            import select as _sel
+            ch = sys.stdin.buffer.read(1).decode("utf-8", errors="replace")
+            if ch != "\x1b":
                 return ch
-            finally:
-                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            # select + 超时读完整转义序列，避免裸 Esc 或长度不定的序列阻塞
+            seq = b""
+            timeout = 0.05
+            while len(seq) < 8:
+                r = _sel.select([sys.stdin.buffer], [], [], timeout)[0]
+                if not r:
+                    break
+                b = sys.stdin.buffer.read(1)
+                seq += b
+                last = seq[-1]
+                if seq[:1] == b'[' and len(seq) >= 2 and 0x40 <= last <= 0x7E:
+                    break  # CSI 序列（\x1b[...letter）结束
+                if seq[:1] == b'O' and len(seq) >= 2:
+                    break  # SS3 序列（\x1bO?）结束
+                timeout = 0.01
+            return "\x1b" + seq.decode("utf-8", errors="replace")
 
     def set_devices(self, devices: list[str]):
         self._devices = devices
@@ -164,7 +172,7 @@ class _Console:
             if " " not in before and result in _NEEDS_ARG:
                 return result + " "
             return result
-        sys.stdout.write("\n  " + "  ".join(matches) + "\n")
+        sys.stdout.write("\r\n  " + "  ".join(matches) + "\r\n")
         self._redisplay("ztdl1x> ", before + word, len(before + word))
         prefix = os.path.commonprefix(matches)
         return prefix if len(prefix) > len(word) else None
@@ -173,7 +181,7 @@ class _Console:
     def _redisplay(prompt: str, line: str, cursor: int):
         sys.stdout.write("\r\x1b[K" + prompt + line)
         if cursor < len(line):
-            sys.stdout.write("\r\x1b[" + str(len(prompt) + cursor + 1) + "C")
+            sys.stdout.write("\r\x1b[" + str(len(prompt) + cursor + 1) + "G")
         sys.stdout.flush()
 
     def input(self, prompt: str = "") -> str:
@@ -193,102 +201,131 @@ class _Console:
         cursor = 0
         self._hindex = len(self._history)
 
-        while True:
+        # Unix：在整个输入会话期间持有 raw 模式，避免字符被终端二次 echo
+        _fd = None
+        _old_attr = None
+        if os.name != "nt":
             try:
-                ch = self._getch()
+                import termios, tty
+                _fd = sys.stdin.fileno()
+                _old_attr = termios.tcgetattr(_fd)
+                tty.setraw(_fd)
             except Exception:
-                # 终端读取异常 → 回退到 input()
                 import builtins
                 return builtins.input(prompt)
 
-            if ch in ("\r", "\n"):
-                sys.stdout.write("\r\n")
-                break
+        try:
+            while True:
+                try:
+                    ch = self._getch()
+                except Exception:
+                    # 终端读取异常 → 先恢复终端，再回退到普通 input()
+                    if _old_attr is not None:
+                        try:
+                            import termios
+                            termios.tcsetattr(_fd, termios.TCSADRAIN, _old_attr)
+                        except Exception:
+                            pass
+                        _old_attr = None
+                    import builtins
+                    return builtins.input(prompt)
 
-            elif ch in ("\x08", "\x7f"):           # Backspace
-                if cursor > 0 and line:
-                    line = line[:cursor - 1] + line[cursor:]
-                    cursor -= 1
-                    self._redisplay(prompt, line, cursor)
-
-            elif ch == "\x04":                     # Ctrl+D
-                if not line:
+                if ch in ("\r", "\n"):
                     sys.stdout.write("\r\n")
-                    raise EOFError()
-                # 非空行当作 Delete
-                if cursor < len(line):
-                    line = line[:cursor] + line[cursor + 1:]
+                    break
+
+                elif ch in ("\x08", "\x7f"):           # Backspace
+                    if cursor > 0 and line:
+                        line = line[:cursor - 1] + line[cursor:]
+                        cursor -= 1
+                        self._redisplay(prompt, line, cursor)
+
+                elif ch == "\x04":                     # Ctrl+D
+                    if not line:
+                        sys.stdout.write("\r\n")
+                        raise EOFError()
+                    # 非空行当作 Delete
+                    if cursor < len(line):
+                        line = line[:cursor] + line[cursor + 1:]
+                        self._redisplay(prompt, line, cursor)
+
+                elif ch == "\x03":                     # Ctrl+C
+                    sys.stdout.write("^C\r\n")
+                    raise KeyboardInterrupt()
+
+                elif ch in ("\x1b[A", "\x1bOA"):       # ↑
+                    self._nav_history(prompt, -1, line, cursor)
+                    if self._hindex < len(self._history):
+                        line = self._history[self._hindex]
+                    else:
+                        line = self._saved_line
+                    cursor = len(line)
                     self._redisplay(prompt, line, cursor)
 
-            elif ch == "\x03":                     # Ctrl+C
-                sys.stdout.write("^C\r\n")
-                raise KeyboardInterrupt()
+                elif ch in ("\x1b[B", "\x1bOB"):       # ↓
+                    self._nav_history(prompt, 1, line, cursor)
+                    if self._hindex < len(self._history):
+                        line = self._history[self._hindex]
+                    else:
+                        line = self._saved_line
+                    cursor = len(line)
+                    self._redisplay(prompt, line, cursor)
 
-            elif ch == "\x1b[A" or ch == "\x1bOH":  # ↑
-                self._nav_history(prompt, -1, line, cursor)
-                if self._hindex < len(self._history):
-                    line = self._history[self._hindex]
-                else:
-                    line = self._saved_line
-                cursor = len(line)
-                self._redisplay(prompt, line, cursor)
+                elif ch in ("\x1b[C", "\x1bOC"):       # →
+                    if cursor < len(line):
+                        cursor += 1
+                        sys.stdout.write("\x1b[1C")
+                        sys.stdout.flush()
 
-            elif ch == "\x1b[B" or ch == "\x1bOF":  # ↓
-                self._nav_history(prompt, 1, line, cursor)
-                if self._hindex < len(self._history):
-                    line = self._history[self._hindex]
-                else:
-                    line = self._saved_line
-                cursor = len(line)
-                self._redisplay(prompt, line, cursor)
+                elif ch in ("\x1b[D", "\x1bOD"):       # ←
+                    if cursor > 0:
+                        cursor -= 1
+                        sys.stdout.write("\x1b[1D")
+                        sys.stdout.flush()
 
-            elif ch == "\x1b[C":                    # →
-                if cursor < len(line):
+                elif ch in ("\x1b[H", "\x1b[1~", "\x1bOH"):  # Home
+                    cursor = 0
+                    self._redisplay(prompt, line, cursor)
+
+                elif ch in ("\x1b[F", "\x1b[4~", "\x1bOF"):  # End
+                    cursor = len(line)
+                    self._redisplay(prompt, line, cursor)
+
+                elif ch == "\t":                        # Tab
+                    full = line[:cursor]
+                    # 拆分：光标前文本 = before + 当前词
+                    if " " in full:
+                        last_space = full.rfind(" ")
+                        word = full[last_space + 1:]
+                        before = full[:last_space + 1]
+                    else:
+                        word = full
+                        before = ""
+                    completed = self._complete(word, before)
+                    if completed:
+                        line = before + completed + line[cursor:]
+                        cursor = len(before) + len(completed)
+                        self._redisplay(prompt, line, cursor)
+
+                elif ch == "\x0c":                      # Ctrl+L: 清屏
+                    sys.stdout.write("\x1b[2J\x1b[H")
+                    self._redisplay(prompt, line, cursor)
+
+                elif len(ch) == 1 and ord(ch) >= 32:   # 可打印字符
+                    line = line[:cursor] + ch + line[cursor:]
                     cursor += 1
-                    sys.stdout.write("\x1b[1C")
+                    sys.stdout.write("\r\x1b[K" + prompt + line)
+                    if cursor < len(line):
+                        sys.stdout.write("\r\x1b[" + str(len(prompt) + cursor + 1) + "G")
                     sys.stdout.flush()
 
-            elif ch == "\x1b[D":                    # ←
-                if cursor > 0:
-                    cursor -= 1
-                    sys.stdout.write("\x1b[1D")
-                    sys.stdout.flush()
-
-            elif ch == "\x1b[H":                    # Home
-                cursor = 0
-                self._redisplay(prompt, line, cursor)
-
-            elif ch == "\x1b[F":                    # End
-                cursor = len(line)
-                self._redisplay(prompt, line, cursor)
-
-            elif ch == "\t":                        # Tab
-                full = line[:cursor]
-                # 拆分：光标前文本 = before + 当前词
-                if " " in full:
-                    last_space = full.rfind(" ")
-                    word = full[last_space + 1:]
-                    before = full[:last_space + 1]
-                else:
-                    word = full
-                    before = ""
-                completed = self._complete(word, before)
-                if completed:
-                    line = before + completed + line[cursor:]
-                    cursor = len(before) + len(completed)
-                    self._redisplay(prompt, line, cursor)
-
-            elif ch == "\x0c":                      # Ctrl+L: 清屏
-                sys.stdout.write("\x1b[2J\x1b[H")
-                self._redisplay(prompt, line, cursor)
-
-            elif len(ch) == 1 and ord(ch) >= 32:   # 可打印字符
-                line = line[:cursor] + ch + line[cursor:]
-                cursor += 1
-                sys.stdout.write("\r\x1b[K" + prompt + line)
-                if cursor < len(line):
-                    sys.stdout.write("\r\x1b[" + str(len(prompt) + cursor + 1) + "C")
-                sys.stdout.flush()
+        finally:
+            if _old_attr is not None:
+                try:
+                    import termios
+                    termios.tcsetattr(_fd, termios.TCSADRAIN, _old_attr)
+                except Exception:
+                    pass
 
         # 保存到历史
         stripped = line.strip()
@@ -599,6 +636,8 @@ def _build_request(cmd: str, parts: list) -> dict | None:
         if not date_str:
             date_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
         return {"cmd": "export", "dev": dev, "date": date_str, "path": path}
+
+    if cmd == "shutdown":
         if len(parts) > 1:
             print("用法: shutdown  (不接受参数)")
             return None
