@@ -1,0 +1,7 @@
+# Build artifacts
+ztdl1x_cli
+ztdl1x_server
+*.bin
+*.build/
+__pycache__/
+*.pyc

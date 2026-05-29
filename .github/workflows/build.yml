@@ -1,0 +1,55 @@
+name: Build aarch64 binaries
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (aarch64 emulation)
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build in Rocky Linux 8 aarch64 container
+        run: |
+          docker run --platform linux/arm64 --rm \
+            -v ${{ github.workspace }}:/workspace \
+            -w /workspace \
+            rockylinux:8 \
+            bash -c '
+              set -e
+              echo "=== Installing build dependencies ==="
+              dnf install -y epel-release
+              dnf config-manager --set-enabled powertools 2>/dev/null || true
+              dnf install -y python39 python39-devel gcc gcc-c++ make patch
+              python3.9 -m pip install --upgrade pip
+              python3.9 -m pip install nuitka
+
+              echo "=== Building ztdl1x_cli ==="
+              python3.9 -m nuitka --onefile --assume-yes-for-downloads \
+                -o ztdl1x_cli \
+                ztdl1x_cli.py
+
+              echo "=== Building ztdl1x_server ==="
+              python3.9 -m nuitka --onefile --assume-yes-for-downloads \
+                -o ztdl1x_server \
+                ztdl1x_server.py
+
+              echo "=== Build results ==="
+              file ztdl1x_cli ztdl1x_server
+              ls -lh ztdl1x_cli ztdl1x_server
+            '
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ztdl1x-aarch64
+          path: |
+            ztdl1x_cli
+            ztdl1x_server
