@@ -19,6 +19,8 @@ ZTDL-1X TCP Server
     python ztdl1x_server.py --db data/ztdl.db           # 指定数据库路径
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import csv

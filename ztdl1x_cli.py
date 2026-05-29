@@ -9,6 +9,8 @@ ZTDL-1X 服务管理客户端，通过管理端口与后台服务通信。
     ztdl1x --host 192.168.1.100  # 指定管理地址
 """
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 import json
