@@ -42,7 +42,6 @@ jobs:
                 ztdl1x_server.py
 
               echo "=== Build results ==="
-              file ztdl1x_cli ztdl1x_server
               ls -lh ztdl1x_cli ztdl1x_server
             '
 
