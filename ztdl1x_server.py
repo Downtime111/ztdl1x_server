@@ -943,7 +943,7 @@ class AdminHandler:
         if not count:
             return 0, None
         # 清除所有设备的响应事件
-        for session in self.server.devices.values():
+        for session in list(self.server.devices.values()):
             try:
                 session._last_response = None
                 session._response_event.clear()
@@ -953,7 +953,7 @@ class AdminHandler:
         # 并发等所有设备响应
         responses = []
         tasks = []
-        for name, session in self.server.devices.items():
+        for name, session in list(self.server.devices.items()):
             tasks.append(asyncio.create_task(self._wait_one(name, session, timeout)))
         await asyncio.wait(tasks, timeout=timeout)
         for t in tasks:

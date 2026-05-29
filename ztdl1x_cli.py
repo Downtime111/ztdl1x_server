@@ -49,7 +49,6 @@ class _Console:
         self._hindex: int = 0           # 当前浏览位置（len(history)=新行）
         self._saved_line: str = ""       # 浏览历史前暂存的行
         self._use_readline = False
-        self._input_mode = "raw"
         self._commands: list[str] = _COMMANDS[:]
         self._devices: list[str] = []
         self._try_readline()
@@ -63,7 +62,14 @@ class _Console:
             readline.get_line_buffer()
             readline.set_completer_delims(" \t\n;")
             readline.set_completer(self._rl_complete)
+            # bind tab
             for b in ("tab: complete", '"\t": complete'):
+                try:
+                    readline.parse_and_bind(b)
+                except Exception:
+                    continue
+            # bind backspace — 兼容 stty erase 配置差异
+            for b in ('"\\C-?": backward-delete-char', '"\\C-h": backward-delete-char'):
                 try:
                     readline.parse_and_bind(b)
                 except Exception:
@@ -74,10 +80,8 @@ class _Console:
                 pass
             readline.set_history_length(_HISTORY_LENGTH)
             self._use_readline = True
-            self._input_mode = "readline"
         except Exception:
             self._use_readline = False
-            self._input_mode = "raw"
 
     def _rl_complete(self, text: str, state: int) -> str | None:
         import readline
@@ -361,7 +365,7 @@ async def _fetch_devices(reader: asyncio.StreamReader, writer: asyncio.StreamWri
 
 
 async def client(host: str, port: int):
-    print(f"ztdl1x 管理客户端 (服务 {host}:{port}, 输入模式: {_console._input_mode})")
+    print(f"ztdl1x 管理客户端 (服务 {host}:{port})")
     print('输入 help 查看命令，quit 退出客户端\n')
 
     reader: asyncio.StreamReader
