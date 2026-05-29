@@ -329,6 +329,7 @@ class DataStore:
             for table in self.list_tables(dev, year):
                 try:
                     self._add_columns(conn, table, new_fields, from_index=fields.index(new_fields[0]))
+                    conn.commit()
                 except sqlite3.Error as e:
                     logger.warning(f"[{dev}] 追加列失败: {table} ({e})")
 

@@ -62,11 +62,6 @@ class _Console:
         except Exception:
             self._use_readline = False
             return
-        # Nuitka/PyInstaller 编译后 libedit 的 parse_and_bind 可能是空壳，
-        # 退格无法绑定 → 放弃 readline，走可控的原始终端路径
-        if 'python' not in os.path.basename(sys.executable).lower():
-            self._use_readline = False
-            return
         try:
             readline.set_completer_delims(" \t\n;")
             readline.set_completer(self._rl_complete)
@@ -120,17 +115,19 @@ class _Console:
             return ch
         else:
             import select as _sel
-            ch = sys.stdin.buffer.read(1).decode("utf-8", errors="replace")
+            fd = sys.stdin.fileno()
+            ch = os.read(fd, 1).decode("utf-8", errors="replace")
             if ch != "\x1b":
                 return ch
-            # select + 超时读完整转义序列，避免裸 Esc 或长度不定的序列阻塞
+            # 用 os.read + select 直接操作 fd，绕过 BufferedReader 内部缓冲，
+            # 避免 select 误判"无数据"（数据已在 Python 缓冲里但 fd 层看不到）
             seq = b""
             timeout = 0.05
             while len(seq) < 8:
-                r = _sel.select([sys.stdin.buffer], [], [], timeout)[0]
+                r = _sel.select([fd], [], [], timeout)[0]
                 if not r:
                     break
-                b = sys.stdin.buffer.read(1)
+                b = os.read(fd, 1)
                 seq += b
                 last = seq[-1]
                 if seq[:1] == b'[' and len(seq) >= 2 and 0x40 <= last <= 0x7E:
@@ -363,16 +360,6 @@ class _Console:
 # 全局单例
 _console = _Console()
 console_input = _console.input  # 跨平台 input，不覆盖 builtins
-
-
-def check_server(host: str, port: int) -> bool:
-    """快速检查服务是否可达"""
-    try:
-        sock = socket.create_connection((host, port), timeout=2)
-        sock.close()
-        return True
-    except (ConnectionRefusedError, OSError):
-        return False
 
 
 def check_pid_file() -> bool:
@@ -663,9 +650,9 @@ def _print_aligned(rows: list, fields: list[str]):
     if not kept_fields:
         return  # 不应该发生
 
-    # 计算列宽
+    # 计算列宽（遍历全部行，上限 40 字符）
     widths = [len(f) for f in kept_fields]
-    for row in rows[:20]:
+    for row in rows:
         for j, idx in enumerate(kept_indices):
             if idx + 1 < len(row):
                 v = str(row[idx + 1]) if row[idx + 1] is not None else ""
