@@ -58,22 +58,25 @@ class _Console:
     def _try_readline(self):
         try:
             import readline
-            # 验证 readline 是否真正可用（Nuitka/PyInstaller 可能漏掉 so 文件）
-            readline.get_line_buffer()
+            readline.get_line_buffer()  # 验证可用
+        except Exception:
+            self._use_readline = False
+            return
+        # Nuitka/PyInstaller 编译后 libedit 的 parse_and_bind 可能是空壳，
+        # 退格无法绑定 → 放弃 readline，走可控的原始终端路径
+        if 'python' not in os.path.basename(sys.executable).lower():
+            self._use_readline = False
+            return
+        try:
             readline.set_completer_delims(" \t\n;")
             readline.set_completer(self._rl_complete)
-            # bind tab
             for b in ("tab: complete", '"\t": complete'):
                 try:
                     readline.parse_and_bind(b)
                 except Exception:
                     continue
-            # bind backspace — 用八进制字面量，兼容 GNU readline / libedit / Nuitka
-            for b in ('"\\177": backward-delete-char', '"\\010": backward-delete-char'):
-                try:
-                    readline.parse_and_bind(b)
-                except Exception:
-                    continue
+            readline.parse_and_bind('"' + chr(127) + '": backward-delete-char')
+            readline.parse_and_bind('"' + chr(8) + '": backward-delete-char')
             try:
                 readline.read_history_file(_HISTORY_FILE)
             except (FileNotFoundError, OSError):
