@@ -49,6 +49,7 @@ class _Console:
         self._hindex: int = 0           # 当前浏览位置（len(history)=新行）
         self._saved_line: str = ""       # 浏览历史前暂存的行
         self._use_readline = False
+        self._input_mode = "raw"
         self._commands: list[str] = _COMMANDS[:]
         self._devices: list[str] = []
         self._try_readline()
@@ -58,6 +59,8 @@ class _Console:
     def _try_readline(self):
         try:
             import readline
+            # 验证 readline 是否真正可用（Nuitka/PyInstaller 可能漏掉 so 文件）
+            readline.get_line_buffer()
             readline.set_completer_delims(" \t\n;")
             readline.set_completer(self._rl_complete)
             for b in ("tab: complete", '"\t": complete'):
@@ -71,8 +74,10 @@ class _Console:
                 pass
             readline.set_history_length(_HISTORY_LENGTH)
             self._use_readline = True
-        except ImportError:
-            pass
+            self._input_mode = "readline"
+        except Exception:
+            self._use_readline = False
+            self._input_mode = "raw"
 
     def _rl_complete(self, text: str, state: int) -> str | None:
         import readline
@@ -356,7 +361,7 @@ async def _fetch_devices(reader: asyncio.StreamReader, writer: asyncio.StreamWri
 
 
 async def client(host: str, port: int):
-    print(f"ztdl1x 管理客户端 (服务 {host}:{port})")
+    print(f"ztdl1x 管理客户端 (服务 {host}:{port}, 输入模式: {_console._input_mode})")
     print('输入 help 查看命令，quit 退出客户端\n')
 
     reader: asyncio.StreamReader
