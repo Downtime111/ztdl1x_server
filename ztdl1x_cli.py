@@ -68,27 +68,12 @@ class _Console:
                     readline.parse_and_bind(b)
                 except Exception:
                     continue
-            # bind backspace — 从终端 stty 读取实际 erase 字符
-            erase = b'\x7f'  # 默认 DEL
-            try:
-                import termios
-                cc = termios.tcgetattr(0)[6]
-                erase = cc[termios.VERASE]
-            except Exception:
-                pass
-            if erase == b'\x7f':
-                for b in ('"\\C-?": backward-delete-char', 'DEL: backward-delete-char',
-                          'Rubout: backward-delete-char', '"\C-?": backward-delete-char'):
-                    try:
-                        readline.parse_and_bind(b)
-                    except Exception:
-                        continue
-            elif erase == b'\x08':
-                for b in ('"\\C-h": backward-delete-char', '"\C-h": backward-delete-char'):
-                    try:
-                        readline.parse_and_bind(b)
-                    except Exception:
-                        continue
+            # bind backspace — 用八进制字面量，兼容 GNU readline / libedit / Nuitka
+            for b in ('"\\177": backward-delete-char', '"\\010": backward-delete-char'):
+                try:
+                    readline.parse_and_bind(b)
+                except Exception:
+                    continue
             try:
                 readline.read_history_file(_HISTORY_FILE)
             except (FileNotFoundError, OSError):
