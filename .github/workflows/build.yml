@@ -27,7 +27,7 @@ jobs:
               echo "=== Installing build dependencies ==="
               dnf install -y epel-release
               dnf config-manager --set-enabled powertools 2>/dev/null || true
-              dnf install -y python39 python39-devel gcc gcc-c++ make patch
+              dnf install -y python39 python39-devel gcc gcc-c++ make patch patchelf
               python3.9 -m pip install --upgrade pip
               python3.9 -m pip install nuitka
 
