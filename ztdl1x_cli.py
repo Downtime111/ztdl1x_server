@@ -20,7 +20,11 @@ import sys
 import tempfile
 from datetime import datetime, timedelta
 
-# ──────────────────────── 跨平台终端输入（历史 + 补全）─────────────────────────
+from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.history import FileHistory
+
+# ──────────────────────── 跨平台终端输入（prompt_toolkit）─────────────────────────
 
 _COMMANDS = [
     "list", "tables", "query", "pending",
@@ -29,341 +33,71 @@ _COMMANDS = [
     "shutdown", "help", "quit", "exit",
 ]
 
-# 需要跟参数的命令（Tab 补全后自动补空格）
 _NEEDS_ARG = {"tables", "query", "send", "pending", "broadcast", "refresh", "hisdata", "export"}
 
-# 子命令补全（命令 → 候选子命令列表）
 _SUB_COMMANDS = {"pending": ["clear"]}
 
 _HISTORY_FILE = os.path.join(os.path.expanduser("~"), ".ztdl1x_history")
-_HISTORY_LENGTH = 1000
 
 
-class _Console:
-    """跨平台终端输入：↑↓ 历史、Tab 补全、左右光标、退格删除。
-    优先使用 GNU readline（类 Unix），不可用时回退到原始终端 I/O（Windows 也支持）。
-    """
+class _ZTDCompleter(Completer):
+    """Tab 补全：命令名 → 设备名 → 子命令"""
 
     def __init__(self):
-        self._history: list[str] = []
-        self._hindex: int = 0           # 当前浏览位置（len(history)=新行）
-        self._saved_line: str = ""       # 浏览历史前暂存的行
-        self._use_readline = False
-        self._commands: list[str] = _COMMANDS[:]
-        self._devices: list[str] = []
-        self._try_readline()
+        self.devices: list[str] = []
 
-    # ── readline 路径 ──
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        word = document.get_word_before_cursor(WORD=True)
 
-    def _try_readline(self):
-        try:
-            import readline
-            readline.get_line_buffer()  # 验证可用
-        except Exception:
-            self._use_readline = False
-            return
-        try:
-            readline.set_completer_delims(" \t\n;")
-            readline.set_completer(self._rl_complete)
-            for b in ("tab: complete", '"\t": complete'):
-                try:
-                    readline.parse_and_bind(b)
-                except Exception:
-                    continue
-            readline.parse_and_bind('"' + chr(127) + '": backward-delete-char')
-            readline.parse_and_bind('"' + chr(8) + '": backward-delete-char')
-            try:
-                readline.read_history_file(_HISTORY_FILE)
-            except (FileNotFoundError, OSError):
-                pass
-            readline.set_history_length(_HISTORY_LENGTH)
-            self._use_readline = True
-        except Exception:
-            self._use_readline = False
-
-    def _rl_complete(self, text: str, state: int) -> str | None:
-        import readline
-        full = readline.get_line_buffer()
-        beg = readline.get_begidx()
-        before = full[:beg]
-        matches = self._match(text, before)
-        # 唯一匹配 + 需要参数 → 自动补空格（readline 路径也支持）
-        if len(matches) == 1 and " " not in before and matches[0] in _NEEDS_ARG:
-            return (matches[0] + " ") if state == 0 else None
-        try:
-            return matches[state]
-        except IndexError:
-            return None
-
-    def _rl_save(self):
-        try:
-            import readline
-            readline.write_history_file(_HISTORY_FILE)
-        except (ImportError, OSError):
-            pass
-
-    # ── 原始终端路径 ──
-
-    def _getch(self) -> str:
-        """读取单个按键。Windows 用 msvcrt；Unix 由 _raw_input 持有 raw 模式，此处直接读 stdin。"""
-        if os.name == "nt":
-            import msvcrt
-            ch = msvcrt.getwch()
-            if ch in ("\xe0", "\x00"):
-                return "\x1b" + {"H": "[A", "P": "[B", "M": "[C", "K": "[D"}.get(
-                    msvcrt.getwch(), "")
-            return ch
+        stripped = text.strip()
+        if " " not in text or not stripped:
+            candidates = [c for c in _COMMANDS if c.startswith(word)]
         else:
-            import select as _sel
-            fd = sys.stdin.fileno()
-            ch = os.read(fd, 1).decode("utf-8", errors="replace")
-            if ch != "\x1b":
-                return ch
-            # 用 os.read + select 直接操作 fd，绕过 BufferedReader 内部缓冲，
-            # 避免 select 误判"无数据"（数据已在 Python 缓冲里但 fd 层看不到）
-            seq = b""
-            timeout = 0.05
-            while len(seq) < 8:
-                r = _sel.select([fd], [], [], timeout)[0]
-                if not r:
-                    break
-                b = os.read(fd, 1)
-                seq += b
-                last = seq[-1]
-                if seq[:1] == b'[' and len(seq) >= 2 and 0x40 <= last <= 0x7E:
-                    break  # CSI 序列（\x1b[...letter）结束
-                if seq[:1] == b'O' and len(seq) >= 2:
-                    break  # SS3 序列（\x1bO?）结束
-                timeout = 0.01
-            return "\x1b" + seq.decode("utf-8", errors="replace")
+            cmd = stripped.split()[0]
+            if cmd in ("tables", "query", "send", "refresh", "hisdata", "export"):
+                candidates = [d for d in self.devices if d.startswith(word)]
+            else:
+                subs = _SUB_COMMANDS.get(cmd, [])
+                candidates = [s for s in subs if s.startswith(word)]
 
-    def set_devices(self, devices: list[str]):
-        self._devices = devices
+        if len(candidates) == 1 and " " not in text and candidates[0] in _NEEDS_ARG:
+            candidates = [candidates[0] + " "]
 
-    def _match(self, word: str, before: str) -> list[str]:
-        """根据上下文返回补全候选：命令名 / 设备名 / 子命令。"""
-        stripped = before.strip()
-        if " " not in before or not stripped:
-            # 第一词（或只有空白）→ 命令名
-            return [c for c in self._commands if c.startswith(word)]
-        # 第一词之后
-        cmd = stripped.split()[0]
-        if cmd in ("tables", "query", "send", "refresh", "hisdata", "export"):
-            return [d for d in self._devices if d.startswith(word)]
-        # 子命令补全
-        subs = _SUB_COMMANDS.get(cmd, [])
-        if subs:
-            return [s for s in subs if s.startswith(word)]
-        return []
-
-    def _complete(self, word: str, before: str) -> str | None:
-        """补全：返回最长公共前缀（唯一匹配时）或打印候选（多个匹配时）。
-        word: 当前词, before: 光标前的完整文本。
-        """
-        matches = self._match(word, before)
-        if not matches:
-            return None
-        if len(matches) == 1:
-            result = matches[0]
-            # 第一词唯一匹配 + 命令需要参数 → 自动补空格
-            if " " not in before and result in _NEEDS_ARG:
-                return result + " "
-            return result
-        sys.stdout.write("\r\n  " + "  ".join(matches) + "\r\n")
-        self._redisplay("ztdl1x> ", before + word, len(before + word))
-        prefix = os.path.commonprefix(matches)
-        return prefix if len(prefix) > len(word) else None
-
-    @staticmethod
-    def _redisplay(prompt: str, line: str, cursor: int):
-        # \r: 回到行首
-        # \x1b[2K: 清除整个屏幕行 (比 \x1b[K 更彻底)
-        sys.stdout.write("\r\x1b[2K" + prompt + line)
-        # 计算光标位置：回到行首 + 偏移(prompt长度 + cursor位置)
-        pos = len(prompt) + cursor + 1
-        sys.stdout.write(f"\r\x1b[{pos}G")
-        sys.stdout.flush()
-
-    def input(self, prompt: str = "") -> str:
-        if self._use_readline:
-            try:
-                import builtins
-                return builtins.input(prompt)
-            except (EOFError, KeyboardInterrupt):
-                raise
-
-        # Windows: custom raw terminal via msvcrt (reliable)
-        if os.name == "nt":
-            return self._raw_input(prompt)
-
-        # Unix without readline: use built-in input().
-        # The terminal driver handles backspace/arrows correctly.
-        # Avoids the fragile os.read + select escape-sequence parsing
-        # that breaks in Nuitka/PyInstaller binaries.
-        try:
-            import builtins
-            line = builtins.input(prompt)
-        except (EOFError, KeyboardInterrupt):
-            raise
-        stripped = line.strip()
-        if stripped and (not self._history or self._history[-1] != stripped):
-            self._history.append(stripped)
-        if len(self._history) > _HISTORY_LENGTH:
-            self._history = self._history[-_HISTORY_LENGTH:]
-        return line
-
-    def _raw_input(self, prompt: str = "") -> str:
-        """原始终端模式输入循环：处理所有按键。"""
-        # 初始显示
-        sys.stdout.write(prompt)
-        sys.stdout.flush()
-
-        line = ""
-        cursor = 0
-        self._hindex = len(self._history)
-        self._saved_line = ""  # 确保初始为空
-
-        _fd = None
-        _old_attr = None
-        if os.name != "nt":
-            try:
-                import termios, tty
-                _fd = sys.stdin.fileno()
-                _old_attr = termios.tcgetattr(_fd)
-                tty.setraw(_fd)
-            except Exception:
-                import builtins
-                return builtins.input(prompt)
-
-        try:
-            while True:
-                ch = self._getch()
-
-                if ch in ("\r", "\n"):
-                    sys.stdout.write("\r\n")
-                    break
-
-                elif ch in ("\x08", "\x7f"):  # Backspace
-                    if cursor > 0:
-                        line = line[:cursor - 1] + line[cursor:]
-                        cursor -= 1
-                        self._redisplay(prompt, line, cursor)
-
-                elif ch == "\x1b[3~":  # Delete key
-                    if cursor < len(line):
-                        line = line[:cursor] + line[cursor + 1:]
-                        self._redisplay(prompt, line, cursor)
-
-                elif ch == "\x03":  # Ctrl+C
-                    sys.stdout.write("^C\r\n")
-                    raise KeyboardInterrupt()
-
-                elif ch in ("\x1b[A", "\x1bOA"):  # Up
-                    if len(self._history) > 0:
-                        if self._hindex == len(self._history):
-                            self._saved_line = line
-                        if self._hindex > 0:
-                            self._hindex -= 1
-                            line = self._history[self._hindex]
-                            cursor = len(line)
-                            self._redisplay(prompt, line, cursor)
-
-                elif ch in ("\x1b[B", "\x1bOB"):  # Down
-                    if self._hindex < len(self._history):
-                        self._hindex += 1
-                        if self._hindex == len(self._history):
-                            line = self._saved_line
-                        else:
-                            line = self._history[self._hindex]
-                        cursor = len(line)
-                        self._redisplay(prompt, line, cursor)
-
-                elif ch in ("\x1b[C", "\x1bOC"):  # Right
-                    if cursor < len(line):
-                        cursor += 1
-                        sys.stdout.write("\x1b[1C")
-                        sys.stdout.flush()
-
-                elif ch in ("\x1b[D", "\x1bOD"):  # Left
-                    if cursor > 0:
-                        cursor -= 1
-                        sys.stdout.write("\x1b[1D")
-                        sys.stdout.flush()
-
-                elif ch == "\t":  # Tab
-                    full = line[:cursor]
-                    if " " in full:
-                        last_space = full.rfind(" ")
-                        word = full[last_space + 1:]
-                        before = full[:last_space + 1]
-                    else:
-                        word = full
-                        before = ""
-                    completed = self._complete(word, before)
-                    if completed:
-                        line = before + completed + line[cursor:]
-                        cursor = len(before) + len(completed)
-                        self._redisplay(prompt, line, cursor)
-
-                elif len(ch) == 1 and ord(ch) >= 32:  # Printable
-                    line = line[:cursor] + ch + line[cursor:]
-                    cursor += 1
-                    self._redisplay(prompt, line, cursor)
-        finally:
-            if _old_attr is not None:
-                import termios
-                termios.tcsetattr(_fd, termios.TCSADRAIN, _old_attr)
-
-        # 保存到历史
-        stripped = line.strip()
-        if stripped:
-            if not self._history or self._history[-1] != stripped:
-                self._history.append(stripped)
-            if len(self._history) > _HISTORY_LENGTH:
-                self._history = self._history[-_HISTORY_LENGTH:]
-        return line
-
-    def _nav_history(self, prompt: str, direction: int, line: str, cursor: int):
-        """在历史记录中上下导航。"""
-        if self._hindex == len(self._history):
-            self._saved_line = line
-        new_idx = self._hindex + direction
-        if 0 <= new_idx <= len(self._history):
-            self._hindex = new_idx
-
-    def _save_history_file(self):
-        try:
-            with open(_HISTORY_FILE, "w", encoding="utf-8") as f:
-                for entry in self._history[-_HISTORY_LENGTH:]:
-                    f.write(entry + "\n")
-        except OSError:
-            pass
-
-    def save_history(self):
-        """持久化历史到文件（退出时调用一次）。"""
-        if self._use_readline:
-            self._rl_save()
-        else:
-            self._save_history_file()
+        for c in candidates:
+            yield Completion(c, start_position=-len(word))
 
 
-# 全局单例
-_console = _Console()
-console_input = _console.input  # 跨平台 input，不覆盖 builtins
+_completer = _ZTDCompleter()
+_session = None
+
+
+def _get_session():
+    """延迟创建 PromptSession，避免 import 时报错（如 Windows Git Bash）。"""
+    global _session
+    if _session is None:
+        _session = PromptSession(
+            history=FileHistory(_HISTORY_FILE),
+            completer=_completer,
+        )
+    return _session
+
+
+def console_input(prompt: str = "") -> str:
+    """跨平台终端输入。prompt_toolkit 提供历史、Tab 补全、行编辑。"""
+    return _get_session().prompt(prompt)
+
 
 
 def check_pid_file() -> bool:
     """检查 PID 文件是否存在"""
     pid_path = os.path.join(tempfile.gettempdir(), "ztdl1x_server.pid")
-    if not os.path.exists(pid_path):
-        return False
     try:
         with open(pid_path) as f:
             pid = int(f.read().strip())
-        # 检查进程是否存在
         os.kill(pid, 0)
         return True
-    except (ValueError, OSError):
+    except (FileNotFoundError, ValueError, OSError):
         return False
 
 
@@ -376,7 +110,7 @@ async def _fetch_devices(reader: asyncio.StreamReader, writer: asyncio.StreamWri
         resp = json.loads(raw.decode())
         if resp.get("ok"):
             devices = [d["name"] for d in resp.get("devices", [])]
-            _console.set_devices(devices)
+            _completer.devices = devices
     except Exception:
         pass  # 静默失败，不影响主流程
 
@@ -403,12 +137,12 @@ async def client(host: str, port: int):
         print(f"错误: 连接 {host}:{port} 超时")
         return
 
-    await _fetch_devices(reader, writer)
+    # 后台拉取设备列表，不阻塞用户输入
+    asyncio.create_task(_fetch_devices(reader, writer))
 
     try:
         await _interactive_loop(reader, writer)
     finally:
-        _console.save_history()
         try:
             writer.close()
         except Exception:
@@ -463,13 +197,30 @@ async def _interactive_loop(reader: asyncio.StreamReader, writer: asyncio.Stream
 
 def _validate_dev(dev: str) -> bool:
     """校验设备名是否在已知列表中。列表为空（未拉取）时跳过校验。"""
-    if not _console._devices:
-        return True  # 还没拉取设备列表，放行
-    if dev not in _console._devices:
-        names = ", ".join(_console._devices)
+    if not _completer.devices:
+        return True
+    if dev not in _completer.devices:
+        names = ", ".join(_completer.devices)
         print(f"  未知设备: {dev} (可用: {names} 或 list 刷新)")
         return False
     return True
+
+
+def _arg_is_dev(s: str) -> bool:
+    """判断参数是否为已知设备名。设备列表未拉取时总是返回 True。"""
+    return not _completer.devices or s in _completer.devices
+
+
+def _arg_is_date(s: str) -> bool:
+    try:
+        datetime.strptime(s, "%Y-%m-%d")
+        return True
+    except ValueError:
+        return False
+
+
+def _default_date() -> str:
+    return (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
 
 def _build_request(cmd: str, parts: list) -> dict | None:
@@ -531,8 +282,8 @@ def _build_request(cmd: str, parts: list) -> dict | None:
         if not (1 <= month <= 12):
             print("  月份必须在 1-12 之间")
             return None
-        if limit < 1:
-            print("  limit 必须大于 0")
+        if not (1 <= limit <= 10000):
+            print("  limit 必须在 1-10000 之间")
             return None
         return {"cmd": "query", "dev": dev, "year": year, "month": month, "limit": limit}
 
@@ -579,18 +330,14 @@ def _build_request(cmd: str, parts: list) -> dict | None:
         dev = None
         date_str = None
         for a in args:
-            try:
-                datetime.strptime(a, "%Y-%m-%d")
+            if _arg_is_date(a):
                 date_str = a
-            except ValueError:
-                if dev is None and (_console._devices and a in _console._devices or not _console._devices):
-                    dev = a
-                elif not dev:
-                    print("用法: hisdata [dev] [date]  (默认: 全部设备, 昨天)")
-                    return None
-        if not date_str:
-            date_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        return {"cmd": "hisdata", "dev": dev, "date": date_str}
+            elif dev is None and _arg_is_dev(a):
+                dev = a
+            elif not dev:
+                print("用法: hisdata [dev] [date]  (默认: 全部设备, 昨天)")
+                return None
+        return {"cmd": "hisdata", "dev": dev, "date": date_str or _default_date()}
 
     if cmd == "export":
         # export [dev] [date] [path]
@@ -599,20 +346,16 @@ def _build_request(cmd: str, parts: list) -> dict | None:
         date_str = None
         path = None
         for a in args:
-            try:
-                datetime.strptime(a, "%Y-%m-%d")
+            if _arg_is_date(a):
                 date_str = a
-            except ValueError:
-                if a.endswith(".csv") or "/" in a or "\\" in a:
-                    path = a
-                elif dev is None and (_console._devices and a in _console._devices or not _console._devices):
-                    dev = a
-                elif not dev:
-                    print("用法: export [dev] [date] [path]  (默认: 全部设备, 昨天, ztdl1x_data/)")
-                    return None
-        if not date_str:
-            date_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
-        return {"cmd": "export", "dev": dev, "date": date_str, "path": path}
+            elif a.endswith(".csv") or "/" in a or "\\" in a:
+                path = a
+            elif dev is None and _arg_is_dev(a):
+                dev = a
+            elif not dev:
+                print("用法: export [dev] [date] [path]  (默认: 全部设备, 昨天, ztdl1x_data/)")
+                return None
+        return {"cmd": "export", "dev": dev, "date": date_str or _default_date(), "path": path}
 
     if cmd == "shutdown":
         if len(parts) > 1:
@@ -628,38 +371,39 @@ def _print_aligned(rows: list, fields: list[str]):
     """以对齐列格式打印查询结果，值全为空的列不显示。"""
     col_count = len(fields)
 
-    # 过滤：跳过所有行值全为空的列
+    # 单次遍历：收集每列是否有数据 + 计算列宽 + 缓存字符串值
     keep = [False] * col_count
+    widths = [len(f) for f in fields]
+    str_rows: list[list[str]] = []
+
     for row in rows:
+        str_row: list[str] = []
         for i in range(col_count):
-            if i + 1 < len(row) and row[i + 1] is not None and str(row[i + 1]).strip():
-                keep[i] = True
+            idx = i + 1  # row[0] 是 id 列，数据从 row[1] 开始
+            if idx < len(row) and row[idx] is not None:
+                v = str(row[idx])
+                if v.strip():
+                    keep[i] = True
+                widths[i] = max(widths[i], min(len(v), 40))
+                str_row.append(v)
+            else:
+                str_row.append("")
+        str_rows.append(str_row)
 
-    kept_fields = [fields[i] for i in range(col_count) if keep[i]]
     kept_indices = [i for i in range(col_count) if keep[i]]
+    kept_fields = [fields[i] for i in kept_indices]
     if not kept_fields:
-        return  # 不应该发生
-
-    # 计算列宽（遍历全部行，上限 40 字符）
-    widths = [len(f) for f in kept_fields]
-    for row in rows:
-        for j, idx in enumerate(kept_indices):
-            if idx + 1 < len(row):
-                v = str(row[idx + 1]) if row[idx + 1] is not None else ""
-                widths[j] = max(widths[j], min(len(v), 40))
+        return
 
     # 表头
-    header = " | ".join(f"{kept_fields[j]:<{widths[j]}}" for j in range(len(kept_fields)))
-    sep = "-+-".join("-" * widths[j] for j in range(len(kept_fields)))
+    header = " | ".join(f"{fields[i]:<{widths[i]}}" for i in kept_indices)
+    sep = "-+-".join("-" * widths[i] for i in kept_indices)
     print(f"    {header}")
     print(f"    {sep}")
 
     # 数据行
-    for row in rows:
-        vals = []
-        for j, idx in enumerate(kept_indices):
-            v = str(row[idx + 1]) if idx + 1 < len(row) and row[idx + 1] is not None else ""
-            vals.append(f"{v:<{widths[j]}}")
+    for str_row in str_rows:
+        vals = [f"{str_row[i]:<{widths[i]}}" for i in kept_indices]
         print(f"    {' | '.join(vals)}")
 
 
@@ -677,7 +421,7 @@ def _display_response(cmd: str, resp: dict):
             for d in devices:
                 print(f"  [{d['status']:>6}] {d['name']}  port:{d['port']}  (last: {d['last_seen']})")
         # 同步设备名到补全候选
-        _console.set_devices([d["name"] for d in devices])
+        _completer.devices = [d["name"] for d in devices]
 
     elif cmd == "tables":
         tables = resp.get("tables", [])
