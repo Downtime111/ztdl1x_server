@@ -27,12 +27,14 @@ jobs:
               echo "=== Installing build dependencies ==="
               dnf install -y epel-release
               dnf config-manager --set-enabled powertools 2>/dev/null || true
-              dnf install -y python39 python39-devel gcc gcc-c++ make patch patchelf
+              dnf install -y python39 python39-devel gcc gcc-c++ make patch patchelf readline-devel ncurses-devel
               python3.9 -m pip install --upgrade pip
               python3.9 -m pip install nuitka
+              python3.9 -m pip install gnureadline || true
 
               echo "=== Building ztdl1x_cli ==="
               python3.9 -m nuitka --onefile --assume-yes-for-downloads \
+                --include-module=readline \
                 -o ztdl1x_cli \
                 ztdl1x_cli.py
 

@@ -176,9 +176,12 @@ class _Console:
 
     @staticmethod
     def _redisplay(prompt: str, line: str, cursor: int):
-        sys.stdout.write("\r\x1b[K" + prompt + line)
-        if cursor < len(line):
-            sys.stdout.write("\r\x1b[" + str(len(prompt) + cursor + 1) + "G")
+        # \r: 回到行首
+        # \x1b[2K: 清除整个屏幕行 (比 \x1b[K 更彻底)
+        sys.stdout.write("\r\x1b[2K" + prompt + line)
+        # 计算光标位置：回到行首 + 偏移(prompt长度 + cursor位置)
+        pos = len(prompt) + cursor + 1
+        sys.stdout.write(f"\r\x1b[{pos}G")
         sys.stdout.flush()
 
     def input(self, prompt: str = "") -> str:
@@ -188,17 +191,38 @@ class _Console:
                 return builtins.input(prompt)
             except (EOFError, KeyboardInterrupt):
                 raise
-        return self._raw_input(prompt)
+
+        # Windows: custom raw terminal via msvcrt (reliable)
+        if os.name == "nt":
+            return self._raw_input(prompt)
+
+        # Unix without readline: use built-in input().
+        # The terminal driver handles backspace/arrows correctly.
+        # Avoids the fragile os.read + select escape-sequence parsing
+        # that breaks in Nuitka/PyInstaller binaries.
+        try:
+            import builtins
+            line = builtins.input(prompt)
+        except (EOFError, KeyboardInterrupt):
+            raise
+        stripped = line.strip()
+        if stripped and (not self._history or self._history[-1] != stripped):
+            self._history.append(stripped)
+        if len(self._history) > _HISTORY_LENGTH:
+            self._history = self._history[-_HISTORY_LENGTH:]
+        return line
 
     def _raw_input(self, prompt: str = "") -> str:
         """原始终端模式输入循环：处理所有按键。"""
+        # 初始显示
         sys.stdout.write(prompt)
         sys.stdout.flush()
+
         line = ""
         cursor = 0
         self._hindex = len(self._history)
+        self._saved_line = ""  # 确保初始为空
 
-        # Unix：在整个输入会话期间持有 raw 模式，避免字符被终端二次 echo
         _fd = None
         _old_attr = None
         if os.name != "nt":
@@ -213,84 +237,61 @@ class _Console:
 
         try:
             while True:
-                try:
-                    ch = self._getch()
-                except Exception:
-                    # 终端读取异常 → 先恢复终端，再回退到普通 input()
-                    if _old_attr is not None:
-                        try:
-                            import termios
-                            termios.tcsetattr(_fd, termios.TCSADRAIN, _old_attr)
-                        except Exception:
-                            pass
-                        _old_attr = None
-                    import builtins
-                    return builtins.input(prompt)
+                ch = self._getch()
 
                 if ch in ("\r", "\n"):
                     sys.stdout.write("\r\n")
                     break
 
-                elif ch in ("\x08", "\x7f"):           # Backspace
-                    if cursor > 0 and line:
+                elif ch in ("\x08", "\x7f"):  # Backspace
+                    if cursor > 0:
                         line = line[:cursor - 1] + line[cursor:]
                         cursor -= 1
                         self._redisplay(prompt, line, cursor)
 
-                elif ch == "\x04":                     # Ctrl+D
-                    if not line:
-                        sys.stdout.write("\r\n")
-                        raise EOFError()
-                    # 非空行当作 Delete
+                elif ch == "\x1b[3~":  # Delete key
                     if cursor < len(line):
                         line = line[:cursor] + line[cursor + 1:]
                         self._redisplay(prompt, line, cursor)
 
-                elif ch == "\x03":                     # Ctrl+C
+                elif ch == "\x03":  # Ctrl+C
                     sys.stdout.write("^C\r\n")
                     raise KeyboardInterrupt()
 
-                elif ch in ("\x1b[A", "\x1bOA"):       # ↑
-                    self._nav_history(prompt, -1, line, cursor)
-                    if self._hindex < len(self._history):
-                        line = self._history[self._hindex]
-                    else:
-                        line = self._saved_line
-                    cursor = len(line)
-                    self._redisplay(prompt, line, cursor)
+                elif ch in ("\x1b[A", "\x1bOA"):  # Up
+                    if len(self._history) > 0:
+                        if self._hindex == len(self._history):
+                            self._saved_line = line
+                        if self._hindex > 0:
+                            self._hindex -= 1
+                            line = self._history[self._hindex]
+                            cursor = len(line)
+                            self._redisplay(prompt, line, cursor)
 
-                elif ch in ("\x1b[B", "\x1bOB"):       # ↓
-                    self._nav_history(prompt, 1, line, cursor)
+                elif ch in ("\x1b[B", "\x1bOB"):  # Down
                     if self._hindex < len(self._history):
-                        line = self._history[self._hindex]
-                    else:
-                        line = self._saved_line
-                    cursor = len(line)
-                    self._redisplay(prompt, line, cursor)
+                        self._hindex += 1
+                        if self._hindex == len(self._history):
+                            line = self._saved_line
+                        else:
+                            line = self._history[self._hindex]
+                        cursor = len(line)
+                        self._redisplay(prompt, line, cursor)
 
-                elif ch in ("\x1b[C", "\x1bOC"):       # →
+                elif ch in ("\x1b[C", "\x1bOC"):  # Right
                     if cursor < len(line):
                         cursor += 1
                         sys.stdout.write("\x1b[1C")
                         sys.stdout.flush()
 
-                elif ch in ("\x1b[D", "\x1bOD"):       # ←
+                elif ch in ("\x1b[D", "\x1bOD"):  # Left
                     if cursor > 0:
                         cursor -= 1
                         sys.stdout.write("\x1b[1D")
                         sys.stdout.flush()
 
-                elif ch in ("\x1b[H", "\x1b[1~", "\x1bOH"):  # Home
-                    cursor = 0
-                    self._redisplay(prompt, line, cursor)
-
-                elif ch in ("\x1b[F", "\x1b[4~", "\x1bOF"):  # End
-                    cursor = len(line)
-                    self._redisplay(prompt, line, cursor)
-
-                elif ch == "\t":                        # Tab
+                elif ch == "\t":  # Tab
                     full = line[:cursor]
-                    # 拆分：光标前文本 = before + 当前词
                     if " " in full:
                         last_space = full.rfind(" ")
                         word = full[last_space + 1:]
@@ -304,25 +305,14 @@ class _Console:
                         cursor = len(before) + len(completed)
                         self._redisplay(prompt, line, cursor)
 
-                elif ch == "\x0c":                      # Ctrl+L: 清屏
-                    sys.stdout.write("\x1b[2J\x1b[H")
-                    self._redisplay(prompt, line, cursor)
-
-                elif len(ch) == 1 and ord(ch) >= 32:   # 可打印字符
+                elif len(ch) == 1 and ord(ch) >= 32:  # Printable
                     line = line[:cursor] + ch + line[cursor:]
                     cursor += 1
-                    sys.stdout.write("\r\x1b[K" + prompt + line)
-                    if cursor < len(line):
-                        sys.stdout.write("\r\x1b[" + str(len(prompt) + cursor + 1) + "G")
-                    sys.stdout.flush()
-
+                    self._redisplay(prompt, line, cursor)
         finally:
             if _old_attr is not None:
-                try:
-                    import termios
-                    termios.tcsetattr(_fd, termios.TCSADRAIN, _old_attr)
-                except Exception:
-                    pass
+                import termios
+                termios.tcsetattr(_fd, termios.TCSADRAIN, _old_attr)
 
         # 保存到历史
         stripped = line.strip()
