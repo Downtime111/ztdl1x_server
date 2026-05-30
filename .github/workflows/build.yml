@@ -29,7 +29,7 @@ jobs:
               dnf config-manager --set-enabled powertools 2>/dev/null || true
               dnf install -y python39 python39-devel gcc gcc-c++ make patch patchelf
               python3.9 -m pip install --upgrade pip
-              python3.9 -m pip install nuitka prompt_toolkit
+              python3.9 -m pip install "nuitka[onefile]" prompt_toolkit
 
               echo "=== Building ztdl1x_cli ==="
               python3.9 -m nuitka --onefile --assume-yes-for-downloads \
